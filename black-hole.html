@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Black Hole — Geodesic Ray-Tracer</title>
+<title>Kerr Black Hole — Geodesic Ray-Tracer</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
     font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
@@ -18,8 +18,8 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <b>Schwarzschild black hole</b> — real-time null-geodesic ray tracing<br />
-  Light rays integrated through curved spacetime · gravitational + Doppler shift · HDR bloom<br />
+  <b>Kerr black hole</b> (spin a/M = 0.84) — real-time geodesic ray tracing in curved spacetime<br />
+  Hamiltonian integration of the Kerr metric · frame-dragging warps the shadow · grav + Doppler shift · HDR bloom<br />
   Drag to orbit · scroll to zoom
 </div>
 <div id="err"></div>
@@ -31,7 +31,7 @@ const vec2 verts[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
 void main(){ gl_Position = vec4(verts[gl_VertexID], 0.0, 1.0); }
 </script>
 
-<!-- ===================== SCENE FRAGMENT SHADER ===================== -->
+<!-- ===================== SCENE FRAGMENT SHADER (Kerr) ===================== -->
 <script id="fsScene" type="x-shader/x-fragment">#version 300 es
 precision highp float;
 out vec4 fragColor;
@@ -45,22 +45,26 @@ uniform vec3  uCamFwd;
 uniform float uTanHalfFov;
 
 /*
- * Units: Schwarzschild radius r_s = 1, horizon at the unit sphere, M = 0.5.
- * A photon obeys the null-geodesic equation, which in Cartesian form is the
- * central acceleration
+ * Rotating (Kerr) black hole, geometrized units with M = 0.5 so the
+ * Schwarzschild radius r_s = 2M = 1. Spin a = 0.42 (a/M = 0.84). The spin
+ * axis is world +Y; the accretion disk lies in the equatorial plane y = 0.
  *
- *     d^2x/dλ^2 = -3/2 · |L|^2 · x / r^5 ,     L = x × v
+ * Photons follow null geodesics of the Kerr metric. We integrate them with a
+ * HAMILTONIAN formulation in Boyer-Lindquist coordinates (r, theta, phi):
  *
- * carrying ALL the light bending (weak-field limit -> deflection 2 r_s / b).
- * We integrate it backwards from the camera with RK4. Output is LINEAR HDR;
- * tonemapping happens in the composite pass after bloom.
+ *     H = 1/2 g^{mu nu} p_mu p_nu = 0   (null)
+ *
+ * The energy E = -p_t and axial angular momentum L = p_phi are conserved
+ * (t and phi are cyclic), so we evolve only (r, theta, phi, p_r, p_theta) by
+ * Hamilton's equations, taking dH/dr and dH/dtheta by finite differences of
+ * the inverse metric. Frame-dragging emerges automatically from g^{t phi}.
  */
-#define RS        1.0
-#define HORIZON   1.0
-#define DISK_IN   2.4
-#define DISK_OUT  9.0
-#define ESCAPE    32.0
-#define MAX_STEPS 300
+#define MASS   0.5
+#define A_SPIN 0.42
+#define DISK_IN  1.9
+#define DISK_OUT 9.0
+#define ESCAPE   30.0
+#define MAX_STEPS 240
 
 float hash31(vec3 p){
   p = fract(p * 0.3183099 + 0.1); p *= 17.0;
@@ -96,79 +100,158 @@ vec3 starField(vec3 dir){
   return col + neb;
 }
 
-// emission of the accretion disk at a crossing point, with full relativistic
-// frequency shift (gravitational redshift * relativistic Doppler).
-vec3 diskEmission(vec3 cp, vec3 vel){
-  float cr  = length(cp.xz);
-  float rad = clamp((cr - DISK_IN) / (DISK_OUT - DISK_IN), 0.0, 1.0);
-  float ang = atan(cp.z, cp.x);
+// --- Kerr inverse metric (Boyer-Lindquist), spin axis = Y ------------------
+void metric(float r, float th, out float gtt, out float gtp, out float gpp,
+            out float grr, out float gthth){
+  float s2 = max(sin(th)*sin(th), 1e-4);
+  float c2 = 1.0 - s2;
+  float a  = A_SPIN;
+  float Sig = r*r + a*a*c2;
+  float Del = r*r - 2.0*MASS*r + a*a;
+  float r2a2 = r*r + a*a;
+  gtt   = -((r2a2*r2a2 - a*a*Del*s2) / (Sig*Del));
+  gtp   = -(2.0*MASS*r*a) / (Sig*Del);
+  gpp   = (Del - a*a*s2) / (Sig*Del*s2);
+  grr   = Del / Sig;
+  gthth = 1.0 / Sig;
+}
 
-  float orbit = uTime * (0.9 / pow(cr, 1.5));         // differential rotation
-  vec3  q = vec3(cos(ang+orbit), sin(ang+orbit), 0.0) * cr;
-  float turb = fbm(vec3(ang*2.0 - orbit*3.0, cr*0.9, 0.0))*0.6 + fbm(q*1.3 + 5.0)*0.6;
+float hamiltonian(float r, float th, float pr, float pth, float pt, float L){
+  float gtt,gtp,gpp,grr,gthth;
+  metric(r, th, gtt,gtp,gpp,grr,gthth);
+  return 0.5*(gtt*pt*pt + 2.0*gtp*pt*L + gpp*L*L + grr*pr*pr + gthth*pth*pth);
+}
+
+// Hamilton's equations: returns time-derivatives of (r,theta,phi,p_r,p_theta)
+void geoDeriv(float r,float th,float ph,float pr,float pth,float pt,float L,
+              out float dr,out float dth,out float dph,out float dpr,out float dpth){
+  float gtt,gtp,gpp,grr,gthth;
+  metric(r, th, gtt,gtp,gpp,grr,gthth);
+  dr  = grr*pr;
+  dth = gthth*pth;
+  dph = gtp*pt + gpp*L;
+  float e = 1e-3;
+  dpr  = -(hamiltonian(r+e,th,pr,pth,pt,L) - hamiltonian(r-e,th,pr,pth,pt,L)) / (2.0*e);
+  dpth = -(hamiltonian(r,th+e,pr,pth,pt,L) - hamiltonian(r,th-e,pr,pth,pt,L)) / (2.0*e);
+}
+
+void deriv(float y[5], float pt, float L, out float d[5]){
+  geoDeriv(y[0],y[1],y[2],y[3],y[4], pt, L, d[0],d[1],d[2],d[3],d[4]);
+}
+
+// accretion-disk emission at BL radius cr / azimuth ph, given photon direction
+vec3 diskEmission(float cr, float ph, vec3 pdir){
+  float rad = clamp((cr - DISK_IN) / (DISK_OUT - DISK_IN), 0.0, 1.0);
+  float orbit = uTime * (0.9 / pow(cr, 1.5));
+  vec3  q = vec3(cos(ph+orbit), sin(ph+orbit), 0.0) * cr;
+  float turb = fbm(vec3(ph*2.0 - orbit*3.0, cr*0.9, 0.0))*0.6 + fbm(q*1.3 + 5.0)*0.6;
   float density = smoothstep(0.35, 1.0, turb) * (0.6 + 0.7*(1.0-rad));
 
-  // rest-frame colour: hot blue-white inner -> orange outer (T ~ r^-3/4)
   float temp = pow(1.0 - rad, 0.75);
   vec3  base = mix(vec3(1.0,0.55,0.18), vec3(0.75,0.86,1.0), temp);
 
-  // --- relativistic frequency shift g = doppler * gravitational ---
-  vec3  vorb  = normalize(cross(vec3(0.0,1.0,0.0), cp));     // orbital direction
-  float beta  = clamp(sqrt(0.5 / max(cr,1.2)), 0.0, 0.85);   // Keplerian speed
+  // prograde orbital direction (with the spin) -> phi-hat in the equator
+  float sp = sin(ph), cp = cos(ph);
+  vec3  vorb  = vec3(-sp, 0.0, cp);
+  float beta  = clamp(sqrt(0.5 / max(cr,1.2)), 0.0, 0.88);
   float gamma = 1.0 / sqrt(1.0 - beta*beta);
-  vec3  toObs = normalize(-vel);                             // photon -> camera
+  vec3  toObs = -pdir;
   float doppler = 1.0 / (gamma * (1.0 - beta*dot(vorb,toObs)));
-  float grav    = sqrt(max(0.0001, 1.0 - RS/cr));            // gravitational redshift
-  float g = doppler * grav;                                   // total shift
+  float grav    = sqrt(max(1e-4, 1.0 - 1.0/cr));        // gravitational redshift
+  float g = doppler * grav;
 
-  // observed specific intensity boosts as g^4; colour shifts blue/red with g
   float boost = clamp(pow(g, 4.0), 0.0, 7.0);
   vec3  shift = mix(vec3(1.0,0.42,0.20), vec3(0.7,0.82,1.25), clamp((g-0.55)/0.9, 0.0, 1.0));
-
   float brightness = density * (0.5 + 1.1*(1.0-rad)) * boost;
   return base * shift * brightness * 0.32;
 }
 
-vec3 accel(vec3 pos, vec3 vel){
-  vec3 L = cross(pos, vel);
-  return -1.5 * dot(L,L) * pos / pow(length(pos), 5.0);
+// Cartesian unit-vector basis of BL coords at (th, ph), spin axis = Y
+void blBasis(float th, float ph, out vec3 er, out vec3 et, out vec3 ep){
+  float st=sin(th), ct=cos(th), sp=sin(ph), cp=cos(ph);
+  er = vec3(st*cp, ct, st*sp);
+  et = vec3(ct*cp, -st, ct*sp);
+  ep = vec3(-sp, 0.0, cp);
 }
 
 void main(){
   vec2 uv = (gl_FragCoord.xy*2.0 - uRes) / uRes.y;
   vec3 rd = normalize(uCamFwd + uCamRight*uv.x*uTanHalfFov + uCamUp*uv.y*uTanHalfFov);
 
-  vec3 pos = uCamPos, vel = rd;
-  vec3 diskCol = vec3(0.0); float diskA = 0.0; bool captured = false;
+  // --- camera Cartesian -> Boyer-Lindquist (oblate spheroidal), axis = Y ---
+  vec3  P = uCamPos;
+  float a = A_SPIN;
+  float rho2 = dot(P,P);
+  float r2 = 0.5*((rho2 - a*a) + sqrt((rho2 - a*a)*(rho2 - a*a) + 4.0*a*a*P.y*P.y));
+  float r0  = sqrt(r2);
+  float th0 = acos(clamp(P.y / r0, -1.0, 1.0));
+  float ph0 = atan(P.z, P.x);
+
+  vec3 er, et, ep; blBasis(th0, ph0, er, et, ep);
+  float pr0  = dot(rd, er);                 // flat-space momenta (camera is far)
+  float pth0 = r0 * dot(rd, et);
+  float pphi = r0 * sin(th0) * dot(rd, ep);
+  float pt   = -1.0;                          // E = 1 (affine scale)
+  float L    = pphi;
+
+  float y[5];
+  y[0]=r0; y[1]=th0; y[2]=ph0; y[3]=pr0; y[4]=pth0;
+
+  float rplus = MASS + sqrt(max(0.0, MASS*MASS - a*a));   // outer horizon
+  vec3  diskCol = vec3(0.0); float diskA = 0.0;
+  bool  captured = false;
+  float prevCos = cos(y[1]);
 
   for(int i=0;i<MAX_STEPS;i++){
-    float r = length(pos);
-    if(r < HORIZON){ captured = true; break; }
-    if(r > ESCAPE && dot(pos,vel) > 0.0) break;
+    float r   = y[0];
+    float Del = r*r - 2.0*MASS*r + a*a;
+    if(r < rplus*1.04 || Del < 0.03){ captured = true; break; }
+    if(r > ESCAPE) break;
 
-    float dt = 0.12 + 0.05*r;
-    vec3 a1 = accel(pos, vel);
-    vec3 a2 = accel(pos + 0.5*dt*vel,             vel + 0.5*dt*a1);
-    vec3 a3 = accel(pos + 0.5*dt*(vel+0.5*dt*a1), vel + 0.5*dt*a2);
-    vec3 a4 = accel(pos + dt*(vel+dt*a2),         vel + dt*a3);
-    vec3 nPos = pos + dt*(vel + dt/6.0*(a1+a2+a3));
-    vec3 nVel = vel + dt/6.0*(a1 + 2.0*a2 + 2.0*a3 + a4);
+    float h = 0.14 * (1.0 + 0.12*r);
 
-    if(nPos.y * pos.y < 0.0 && diskA < 0.99){
-      float t  = pos.y / (pos.y - nPos.y);
-      vec3  cp = mix(pos, nPos, t);
-      float cr = length(cp.xz);
-      if(cr > DISK_IN && cr < DISK_OUT){
-        vec3 em = diskEmission(cp, mix(vel, nVel, t));
-        float a = clamp(length(em)*0.6, 0.0, 1.0) * 0.85;
+    float k1[5],k2[5],k3[5],k4[5],tmp[5],yn[5];
+    deriv(y, pt, L, k1);
+    for(int j=0;j<5;j++) tmp[j] = y[j] + 0.5*h*k1[j];
+    deriv(tmp, pt, L, k2);
+    for(int j=0;j<5;j++) tmp[j] = y[j] + 0.5*h*k2[j];
+    deriv(tmp, pt, L, k3);
+    for(int j=0;j<5;j++) tmp[j] = y[j] + h*k3[j];
+    deriv(tmp, pt, L, k4);
+    for(int j=0;j<5;j++) yn[j] = y[j] + h/6.0*(k1[j]+2.0*k2[j]+2.0*k3[j]+k4[j]);
+    yn[1] = clamp(yn[1], 0.02, 3.12139);
+
+    // equatorial-plane (disk) crossing
+    float newCos = cos(yn[1]);
+    if(prevCos*newCos < 0.0 && diskA < 0.99){
+      float t  = prevCos / (prevCos - newCos);
+      float rc = mix(y[0], yn[0], t);
+      if(rc > DISK_IN && rc < DISK_OUT){
+        float phc = mix(y[2], yn[2], t);
+        float ic0=mix(y[0],yn[0],t), ic1=mix(y[1],yn[1],t),
+              ic3=mix(y[3],yn[3],t), ic4=mix(y[4],yn[4],t);
+        float d0,d1,d2,d3,d4;
+        geoDeriv(ic0,ic1,phc,ic3,ic4,pt,L,d0,d1,d2,d3,d4);
+        vec3 er2,et2,ep2; blBasis(ic1, phc, er2, et2, ep2);
+        vec3 pdir = normalize(d0*er2 + ic0*d1*et2 + ic0*sin(ic1)*d2*ep2);
+        vec3 em = diskEmission(rc, phc, pdir);
+        float al = clamp(length(em)*0.6, 0.0, 1.0) * 0.85;
         diskCol += (1.0 - diskA) * em;
-        diskA    = diskA + (1.0 - diskA) * a;
+        diskA    = diskA + (1.0 - diskA) * al;
       }
     }
-    pos = nPos; vel = nVel;
+    prevCos = newCos;
+    for(int j=0;j<5;j++) y[j] = yn[j];
   }
 
-  vec3 bg  = captured ? vec3(0.0) : starField(normalize(vel));
+  vec3 bg = vec3(0.0);
+  if(!captured){
+    float d0,d1,d2,d3,d4;
+    geoDeriv(y[0],y[1],y[2],y[3],y[4],pt,L,d0,d1,d2,d3,d4);
+    vec3 er3,et3,ep3; blBasis(y[1], y[2], er3, et3, ep3);
+    vec3 dir = normalize(d0*er3 + y[0]*d1*et3 + y[0]*sin(y[1])*d2*ep3);
+    bg = starField(dir);
+  }
   fragColor = vec4(diskCol + (1.0 - diskA) * bg, 1.0);   // linear HDR
 }
 </script>
@@ -178,10 +261,10 @@ void main(){
 precision highp float;
 out vec4 o;
 uniform sampler2D uTex;
-uniform vec2  uResOut;     // this target's resolution
-uniform vec2  uTexelIn;    // 1 / input texture size
-uniform vec2  uDir;        // (1,0) horizontal or (0,1) vertical
-uniform float uThresh;     // >0 = extract brightness above threshold first
+uniform vec2  uResOut;
+uniform vec2  uTexelIn;
+uniform vec2  uDir;
+uniform float uThresh;
 void main(){
   vec2 uv = gl_FragCoord.xy / uResOut;
   float w[5] = float[5](0.227027, 0.194594, 0.121622, 0.054054, 0.016216);
@@ -205,11 +288,10 @@ uniform vec2 uResOut;
 void main(){
   vec2 uv = gl_FragCoord.xy / uResOut;
   vec3 c = texture(uScene, uv).rgb + texture(uBloom, uv).rgb * 0.9;
-  c *= 1.25;                                   // exposure
-  c = (c*(2.51*c+0.03)) / (c*(2.43*c+0.59)+0.14);   // ACES filmic
-  // subtle vignette
+  c *= 1.25;                                       // exposure
+  c = (c*(2.51*c+0.03)) / (c*(2.43*c+0.59)+0.14);  // ACES filmic
   vec2 d = uv - 0.5;
-  c *= 1.0 - 0.35*dot(d,d);
+  c *= 1.0 - 0.35*dot(d,d);                         // vignette
   o = vec4(pow(clamp(c,0.0,1.0), vec3(0.4545)), 1.0);
 }
 </script>
@@ -248,7 +330,6 @@ const Uc = loc(progComp,  ["uScene","uBloom","uResOut"]);
 const vao = gl.createVertexArray();
 gl.bindVertexArray(vao);
 
-// ---- render targets ----
 function makeTarget(w,h){
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -270,12 +351,10 @@ function allocTargets(w,h){
   bloomB = makeTarget(bw, bh);
 }
 
-// ---- vec3 helpers ----
 const sub  =(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
 const norm =(a)=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l];};
 const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 
-// ---- camera / interaction ----
 let yaw=0.5, pitch=0.16, dist=15.0, autoSpin=true, dragging=false, lastX=0, lastY=0;
 canvas.addEventListener("mousedown", e=>{dragging=true; autoSpin=false; lastX=e.clientX; lastY=e.clientY;});
 window.addEventListener("mouseup", ()=>dragging=false);
@@ -299,7 +378,6 @@ function resize(){
   if(w!==curW || h!==curH){ curW=w; curH=h; allocTargets(w,h); }
 }
 window.addEventListener("resize", resize);
-
 function drawFull(){ gl.drawArrays(gl.TRIANGLES,0,3); }
 
 function frame(ms){
@@ -316,7 +394,7 @@ function frame(ms){
   const right = norm(cross(fwd,[0,1,0]));
   const up    = cross(right,fwd);
 
-  // --- pass 1: scene -> HDR float ---
+  // pass 1: Kerr scene -> HDR
   gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fbo);
   gl.viewport(0,0,scene.w,scene.h);
   gl.useProgram(progScene);
@@ -327,7 +405,7 @@ function frame(ms){
   gl.uniform1f(Us.uTanHalfFov, Math.tan(0.5*50.0*Math.PI/180.0));
   drawFull();
 
-  // --- pass 2: bright extract + horizontal blur -> bloomA (half res) ---
+  // pass 2: bright extract + horizontal blur
   gl.useProgram(progBlur);
   gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fbo);
   gl.viewport(0,0,bloomA.w,bloomA.h);
@@ -335,21 +413,19 @@ function frame(ms){
   gl.uniform1i(Ub.uTex,0);
   gl.uniform2f(Ub.uResOut, bloomA.w, bloomA.h);
   gl.uniform2f(Ub.uTexelIn, 1/scene.w, 1/scene.h);
-  gl.uniform2f(Ub.uDir, 1.0, 0.0);
-  gl.uniform1f(Ub.uThresh, 1.0);
+  gl.uniform2f(Ub.uDir, 1.0, 0.0); gl.uniform1f(Ub.uThresh, 1.0);
   drawFull();
 
-  // --- pass 3: vertical blur -> bloomB ---
+  // pass 3: vertical blur
   gl.bindFramebuffer(gl.FRAMEBUFFER, bloomB.fbo);
   gl.viewport(0,0,bloomB.w,bloomB.h);
   gl.bindTexture(gl.TEXTURE_2D, bloomA.tex);
   gl.uniform2f(Ub.uResOut, bloomB.w, bloomB.h);
   gl.uniform2f(Ub.uTexelIn, 1/bloomA.w, 1/bloomA.h);
-  gl.uniform2f(Ub.uDir, 0.0, 1.0);
-  gl.uniform1f(Ub.uThresh, 0.0);
+  gl.uniform2f(Ub.uDir, 0.0, 1.0); gl.uniform1f(Ub.uThresh, 0.0);
   drawFull();
 
-  // --- pass 4: second blur iteration (wider glow) ---
+  // pass 4: second blur iteration (wider glow)
   gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fbo);
   gl.bindTexture(gl.TEXTURE_2D, bloomB.tex);
   gl.uniform2f(Ub.uTexelIn, 1/bloomB.w, 1/bloomB.h);
@@ -362,7 +438,7 @@ function frame(ms){
   gl.uniform2f(Ub.uDir, 0.0, 1.0);
   drawFull();
 
-  // --- pass 5: composite to screen ---
+  // pass 5: composite
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0,0,canvas.width,canvas.height);
   gl.useProgram(progComp);
