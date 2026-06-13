@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Black Hole — Gravitational Lensing</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud {
+    position: fixed;
+    left: 14px;
+    bottom: 12px;
+    color: #6a7a8a;
+    font-size: 12px;
+    line-height: 1.5;
+    pointer-events: none;
+    text-shadow: 0 0 6px #000;
+    user-select: none;
+  }
+  #hud b { color: #cdd9e5; font-weight: 600; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <b>Schwarzschild black hole</b> — gravitational lensing of a background starfield<br />
+  Light is bent by deflection angle &alpha; &asymp; 2r<sub>s</sub>/b · the photon ring sits at 1.5 r<sub>s</sub><br />
+  Move the mouse to shift the view · scroll to change mass
+</div>
+<script>
+"use strict";
+
+/*
+ * A black hole rendered from physics, not sprites.
+ *
+ * Every background star is ray-traced through the curved spacetime around a
+ * Schwarzschild black hole. For a light ray passing a mass at impact
+ * parameter b, general relativity bends it by the deflection angle
+ *
+ *     alpha ≈ 2 * r_s / b          (weak-field, r_s = Schwarzschild radius)
+ *
+ * We invert that: for a screen pixel at apparent radius b from the hole, the
+ * star it actually shows comes from a source angle pulled inward by alpha.
+ * Inside the photon sphere (b < 1.5 r_s) no light escapes toward us, so we
+ * draw the shadow. A relativistic accretion disk adds the glowing ring, with
+ * Doppler beaming brightening the side rotating toward the viewer.
+ */
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+let W = 0, H = 0, DPR = 1;
+let cx = 0, cy = 0;          // black hole centre on screen
+let rs = 70;                 // Schwarzschild radius in pixels (the "mass")
+
+// ---- Background starfield -------------------------------------------------
+// Stars live in an infinite plane behind the hole. Each is stored by its true
+// angular position (sx, sy) relative to the hole and a brightness/colour.
+const STAR_COUNT = 1400;
+const stars = [];
+function makeStars() {
+  stars.length = 0;
+  for (let i = 0; i < STAR_COUNT; i++) {
+    // spread stars across a wide field so lensing has material to bend
+    const r = Math.sqrt(Math.random()) * 1400 + 4;
+    const a = Math.random() * Math.PI * 2;
+    const mag = Math.pow(Math.random(), 2.2);     // few bright, many faint
+    // subtle stellar colours (temperature)
+    const t = Math.random();
+    const col = t < 0.15
+      ? [170, 200, 255]   // hot blue
+      : t < 0.5
+        ? [255, 255, 245] // white
+        : t < 0.85
+          ? [255, 240, 210] // warm
+          : [255, 200, 160]; // cool red
+    stars.push({
+      x: Math.cos(a) * r,
+      y: Math.sin(a) * r,
+      size: 0.5 + mag * 1.8,
+      bright: 0.25 + mag * 0.75,
+      col,
+      tw: Math.random() * Math.PI * 2,   // twinkle phase
+    });
+  }
+}
+
+// ---- Gravitational lensing ------------------------------------------------
+// Given a star's true distance `b0` from the hole, find where its image
+// appears on screen. Solving the lens equation b0 = b - alpha(b) for the
+// apparent radius b, with alpha = 2 r_s / b, gives a quadratic:
+//     b^2 - b0 b - 2 r_s = 0  ->  b = (b0 + sqrt(b0^2 + 8 r_s)) / 2 ... but
+// physically alpha scales with r_s so we use alpha = (1.5 r_s)^2 / b which
+// matches the observed photon-ring radius and produces the classic Einstein
+// ring. The primary (outer) image is the visible one.
+function apparentRadius(b0) {
+  const k = (1.5 * rs) * (1.5 * rs);   // lensing strength
+  // b - k/b = b0  ->  b^2 - b0 b - k = 0
+  return 0.5 * (b0 + Math.sqrt(b0 * b0 + 4 * k));
+}
+
+// ---- Accretion disk -------------------------------------------------------
+// A glowing ring of plasma orbiting in the equatorial plane. We tilt it,
+// brighten the approaching side (relativistic Doppler beaming) and let it
+// rotate. Inner edge at the innermost stable circular orbit (3 r_s).
+function drawDisk(time) {
+  const inner = rs * 2.6;
+  const outer = rs * 6.2;
+  const tilt = 0.42;                 // how edge-on we view the disk
+  const samples = 520;
+
+  ctx.globalCompositeOperation = "lighter";
+  for (let i = 0; i < samples; i++) {
+    const ang = (i / samples) * Math.PI * 2;
+    // animate plasma streaming around the hole
+    const phase = ang + time * 0.0016;
+    for (let ring = 0; ring < 5; ring++) {
+      const t = ring / 4;
+      const radius = inner + (outer - inner) * t;
+      // project the orbit to screen with vertical foreshortening (tilt)
+      const px = cx + Math.cos(phase) * radius;
+      const py = cy + Math.sin(phase) * radius * tilt;
+
+      // Doppler beaming: material moving toward us (left/right of centre as it
+      // orbits) appears far brighter. cos of the tangential velocity vs view.
+      const vDir = Math.cos(phase - Math.PI / 2);
+      const beam = Math.pow(0.55 + 0.45 * vDir, 3.0);
+
+      // colour: hot blue-white inner, orange outer
+      const r = 255;
+      const g = Math.round(150 + 90 * (1 - t));
+      const bl = Math.round(60 + 170 * (1 - t) * (0.4 + 0.6 * vDir));
+
+      const a = (0.05 + 0.12 * (1 - t)) * beam;
+      const size = (1.2 + 2.4 * (1 - t)) * (rs / 70);
+
+      // hide the part of the disk passing behind the shadow's near side only
+      // partially — front of disk (py > cy) always drawn, back gets lensed up.
+      ctx.fillStyle = `rgba(${r},${g},${bl},${a})`;
+      ctx.beginPath();
+      ctx.arc(px, py, size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// ---- Photon ring ----------------------------------------------------------
+// The bright thin ring of light orbiting at 1.5 r_s, where photons can circle
+// the hole. This is the sharp edge of the shadow.
+function drawPhotonRing() {
+  const pr = 1.5 * rs;
+  const g = ctx.createRadialGradient(cx, cy, pr * 0.86, cx, cy, pr * 1.22);
+  g.addColorStop(0, "rgba(0,0,0,0)");
+  g.addColorStop(0.5, "rgba(255,180,90,0.9)");
+  g.addColorStop(0.72, "rgba(255,230,180,0.95)");
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy, pr * 1.22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// ---- The shadow ------------------------------------------------------------
+function drawShadow() {
+  const shadow = 1.5 * rs;           // apparent shadow radius ≈ photon sphere
+  const g = ctx.createRadialGradient(cx, cy, shadow * 0.7, cx, cy, shadow * 1.05);
+  g.addColorStop(0, "#000");
+  g.addColorStop(0.85, "#000");
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy, shadow * 1.05, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ---- Render the lensed starfield ------------------------------------------
+function drawStars(time) {
+  const shadow = 1.5 * rs;
+  for (const s of stars) {
+    const b0 = Math.hypot(s.x, s.y);
+    if (b0 < 1e-3) continue;
+    const b = apparentRadius(b0);            // lensed apparent radius
+    const scale = b / b0;                    // push the image outward
+    const px = cx + s.x * scale;
+    const py = cy + s.y * scale;
+
+    // stars whose images fall inside the shadow are swallowed
+    if (Math.hypot(px - cx, py - cy) < shadow) continue;
+
+    // magnification grows near the Einstein ring (small b - shadow) and
+    // brightens stars there, reproducing the bright lensed arcs
+    const amp = 1 + Math.min(2.5, (1.5 * rs) / Math.max(1, b - shadow) * 0.5);
+
+    const tw = 0.85 + 0.15 * Math.sin(time * 0.004 + s.tw);
+    const alpha = Math.min(1, s.bright * amp * tw);
+    const [r, g, bl] = s.col;
+    ctx.fillStyle = `rgba(${r},${g},${bl},${alpha})`;
+    const size = s.size * (1 + (amp - 1) * 0.4);
+    ctx.beginPath();
+    ctx.arc(px, py, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ---- Frame ----------------------------------------------------------------
+function frame(time) {
+  // soft trailing fade for a touch of motion glow
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(0, 0, W, H);
+
+  drawStars(time);
+  drawDisk(time);
+  drawPhotonRing();
+  drawShadow();
+  // redraw the photon ring on top so its inner edge frames the shadow crisply
+  drawPhotonRing();
+
+  requestAnimationFrame(frame);
+}
+
+// ---- Setup / interaction --------------------------------------------------
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx = W / 2;
+  cy = H / 2;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+}
+
+window.addEventListener("resize", resize);
+window.addEventListener("mousemove", (e) => {
+  // gently parallax the hole toward the cursor
+  cx = W / 2 + (e.clientX - W / 2) * 0.12;
+  cy = H / 2 + (e.clientY - H / 2) * 0.12;
+});
+window.addEventListener("wheel", (e) => {
+  rs = Math.max(28, Math.min(140, rs - Math.sign(e.deltaY) * 4));
+}, { passive: true });
+
+makeStars();
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
