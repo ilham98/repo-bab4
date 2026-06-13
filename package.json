@@ -1,0 +1,13 @@
+{
+  "name": "kerr-black-hole",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time Kerr (rotating) black hole ray tracer built on Three.js",
+  "scripts": {
+    "build": "esbuild src/black-hole.js --bundle --minify --format=iife --outfile=black-hole.bundle.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "three": "0.160.0"
+  }
+}
